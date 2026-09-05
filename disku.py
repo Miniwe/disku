@@ -1,17 +1,23 @@
 #!/usr/bin/env python3
-"""disku -- measure where disk space went on macOS, and say what is safe to drop.
+"""disku -- measure where disk space went, and say what is safe to drop.
+
+Runs on Linux and macOS. The scanner, the arithmetic and the report are the
+same on both; everything platform-specific lives in system.py (what to scan,
+how the volume reports itself, which mounts must not be walked) and in
+rules_linux.py / rules_darwin.py (which paths are junk and which are precious).
 
 This tool is read-only by design: it contains no delete, move or truncate call
-anywhere. It measures, classifies against rules.py, and prints commands for you
-to run yourself after reading them.
+anywhere. It measures, classifies, and prints commands for you to run yourself
+after reading them.
 
     ./disku.py                      # full report on the usual suspects
     ./disku.py --tree               # just the size tree
-    ./disku.py --roots ~/Library/Containers --depth 3
+    ./disku.py /var/lib/docker --depth 3
     ./disku.py --md report.md --json report.json
+    sudo ./disku.py                 # on Linux, most of /var needs root
 
 Sizes are *allocated blocks* (what the filesystem actually spends), matching
-`du`, not the logical file length shown by Finder's Get Info.
+`du`, not the logical file length.
 """
 
 import argparse
@@ -19,15 +25,15 @@ import concurrent.futures as cf
 import heapq
 import json
 import os
-import shutil
-import subprocess
 import sys
 import threading
 from dataclasses import dataclass, field
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import rules as R
+import system as S
 
+SYS = S.detect()
 HOME = os.path.expanduser("~")
 MB = 1024 * 1024
 GB = 1024 * MB
@@ -46,7 +52,7 @@ def human(n):
 
 
 def rel(path):
-    """Home-relative path when inside $HOME, absolute otherwise."""
+    """Home-relative path when inside $HOME, absolute otherwise (display only)."""
     if path == HOME:
         return "."
     if path.startswith(HOME + "/"):
@@ -54,14 +60,39 @@ def rel(path):
     return path
 
 
-COMMANDS = {"mv", "rm", "brew", "docker", "npm", "npx", "yarn", "pnpm", "pip",
-            "go", "pod", "cargo", "xcrun", "rustup", "nvm", "pyenv", "sudo",
-            "tmutil", "git", "defaults", "find"}
+COMMANDS = {
+    # generic
+    "mv", "rm", "sudo", "find", "git", "truncate", "du", "ncdu",
+    # package managers
+    "brew", "apt", "apt-get", "aptitude", "dpkg", "dnf", "yum", "pacman",
+    "paccache", "snap", "flatpak", "nix-collect-garbage", "localepurge",
+    # language toolchains
+    "npm", "npx", "yarn", "pnpm", "pip", "pipx", "uv", "poetry", "conda",
+    "go", "cargo", "rustup", "nvm", "pyenv", "gem", "bundle", "composer",
+    "dotnet", "bazel", "ccache", "sccache", "pre-commit", "pod", "gradle",
+    "mvn", "huggingface-cli", "ollama", "terraform",
+    # containers
+    "docker", "podman", "ctr", "crictl", "nerdctl", "lxc", "machinectl",
+    # system
+    "journalctl", "systemctl", "systemd-tmpfiles", "coredumpctl", "logrotate",
+    "tune2fs", "cloud-init", "gio", "trash-put", "postsuper", "mailq",
+    "xcrun", "tmutil", "defaults", "python3",
+}
 
 
 def is_command(hint):
     """A hint is runnable if it starts with something you can actually type."""
     return bool(hint) and hint.split(" ", 1)[0].strip('"') in COMMANDS
+
+
+def hint_text(f):
+    """The hint as you would actually run it against this particular path."""
+    text = f.hint.format(path=f.path)
+    if text.startswith('mv "'):
+        parent = os.path.dirname(f.path.rstrip("/")) or "/"
+        if not os.access(parent, os.W_OK):
+            text = "sudo " + text.replace("~/.disku-trash/", "/var/tmp/disku-trash/")
+    return text
 
 
 def bar(fraction, width=22):
@@ -84,9 +115,11 @@ class Node:
 
 
 class Scanner:
-    def __init__(self, one_fs=True, top_files=30):
+    def __init__(self, one_fs=True, top_files=30, skip=None):
         self.one_fs = one_fs
+        self.skip = skip or (lambda path: False)
         self.denied = []
+        self.skipped = []          # mounts deliberately not walked
         self.vanished = 0
         self.dirs = 0
         self.files = 0
@@ -101,6 +134,18 @@ class Scanner:
             heapq.heappush(h, (size, path))
         elif size > h[0][0]:
             heapq.heapreplace(h, (size, path))
+
+    def _take_dir(self, path, st, dev):
+        """Walk into this directory? Mount rules first, then the one-fs rule."""
+        if self.skip(path):
+            with self._lock:
+                self.skipped.append(path)
+            return False
+        if self.one_fs and st.st_dev != dev:
+            with self._lock:
+                self.skipped.append(path)
+            return False
+        return True
 
     def scan(self, root, dev=None):
         node = Node(root)
@@ -137,9 +182,8 @@ class Scanner:
                 node.size += st.st_blocks * 512
                 continue
             if entry.is_dir(follow_symlinks=False):
-                if self.one_fs and st.st_dev != dev:
-                    continue
-                subdirs.append(entry.path)
+                if self._take_dir(entry.path, st, dev):
+                    subdirs.append(entry.path)
                 continue
             # regular file / socket / device
             if st.st_nlink > 1:
@@ -197,9 +241,8 @@ class Scanner:
             if entry.is_symlink():
                 continue
             if entry.is_dir(follow_symlinks=False):
-                if self.one_fs and est.st_dev != dev:
-                    continue
-                subdirs.append(entry.path)
+                if self._take_dir(entry.path, est, dev):
+                    subdirs.append(entry.path)
             else:
                 sz = est.st_blocks * 512
                 node.own += sz
@@ -235,6 +278,7 @@ class Finding:
     quit_app: str
     tags: tuple
     pattern: str
+    opaque: bool = True           # False for rules the walker keeps descending into
     nested_safe: int = 0          # SAFE bytes found inside a CAUTION/KEEP node
     children: list = field(default_factory=list)
 
@@ -256,13 +300,13 @@ def classify(node, out, depth=0, max_depth=12, min_size=20 * MB):
 
     Hiding deeper findings from the parent is what keeps the arithmetic honest:
     a parent charges itself only the bytes its own children did not already
-    claim, so Docker's container folder and the VM image inside it no longer
-    both bill 13G.
+    claim, so Docker's data root and the overlay2 tree inside it no longer both
+    bill 13G.
     """
     if node.size < min_size or depth > max_depth:
         return []
 
-    rule = R.match(rel(node.path), node.name)
+    rule = R.match(SYS.rulepath(node.path), node.name)
     if rule and not rule.walk_in:
         out.append(Finding(node.path, node.size, rule.safety, rule.label,
                            rule.hint, rule.quit_app, rule.tags, rule.pattern))
@@ -274,7 +318,7 @@ def classify(node, out, depth=0, max_depth=12, min_size=20 * MB):
 
     if rule:
         f = Finding(node.path, node.size, rule.safety, rule.label, rule.hint,
-                    rule.quit_app, rule.tags, rule.pattern,
+                    rule.quit_app, rule.tags, rule.pattern, opaque=False,
                     nested_safe=sum(n.size for n in nested), children=list(nested))
         out.append(f)
         return [f]
@@ -284,15 +328,23 @@ def classify(node, out, depth=0, max_depth=12, min_size=20 * MB):
 def unclassified(node, findings, min_size, limit=15):
     """Dirs holding a lot of bytes directly, with no rule and no cache name.
 
-    This is the "you have to look at this yourself" list.
+    This is the "you have to look at this yourself" list. A directory covered
+    by a rule is not a decision you have to make, so its subtree is skipped --
+    except under the handful of rules tagged `survey` (/home, /srv, /opt, /usr,
+    the temp roots), which say nothing about what is *inside* them.
     """
-    known = {f.path for f in findings}
+    by_path = {f.path: f for f in findings}
     hits = []
 
     def walk(n, depth):
         if n.size < min_size or depth > 8:
             return
-        if n.path in known:
+        f = by_path.get(n.path)
+        if f is not None:
+            if f.opaque or "survey" not in f.tags:
+                return
+            for c in n.children:
+                walk(c, depth + 1)
             return
         if n.own >= min_size:
             hits.append((n.own, n.path, n.nfiles))
@@ -304,36 +356,14 @@ def unclassified(node, findings, min_size, limit=15):
     return hits[:limit]
 
 
-# --------------------------------------------------------------------- system
-
-def disk_overview():
-    total, used, free = shutil.disk_usage("/System/Volumes/Data")
-    info = {"total": total, "used": used, "free": free}
-    try:
-        out = subprocess.run(["tmutil", "listlocalsnapshots", "/"],
-                             capture_output=True, text=True, timeout=20).stdout
-        info["snapshots"] = [l.strip() for l in out.splitlines()
-                             if l.strip().startswith("com.apple")]
-    except Exception:
-        info["snapshots"] = []
-    try:
-        out = subprocess.run(["diskutil", "info", "/System/Volumes/Data"],
-                             capture_output=True, text=True, timeout=20).stdout
-        for line in out.splitlines():
-            if "Purgeable" in line and ":" in line:
-                info["purgeable_raw"] = line.split(":", 1)[1].strip()
-    except Exception:
-        pass
-    return info
-
-
-DEFAULT_ROOTS = [
-    "~/Library",
-    "~/.cache", "~/.npm", "~/.gradle", "~/.m2", "~/.cargo", "~/.rustup",
-    "~/go", "~/.docker", "~/.nvm", "~/.pyenv", "~/.local/share",
-    "~/.Trash", "~/Downloads",
-    "/Applications", "/Library/Caches", "/Library/Application Support",
-]
+def prune_contained(roots):
+    """Drop roots that sit inside another root -- scanning both counts twice."""
+    kept = []
+    for path in sorted(roots, key=len):
+        if any(path == k or path.startswith(k.rstrip("/") + "/") for k in kept):
+            continue
+        kept.append(path)
+    return kept
 
 
 # ---------------------------------------------------------------------- report
@@ -390,35 +420,29 @@ def emit_one(rep, f, indent="  "):
     if f.nested_note:
         rep.w(f"{indent}          {f.nested_note}")
     if f.quit_app:
-        rep.w(f"{indent}          quit {f.quit_app} first")
+        rep.w(f"{indent}          {SYS.stop_verb} {f.quit_app} first")
     if f.hint:
-        text = f.hint.format(path=f.path)
-        rep.w(f"{indent}          {'$' if is_command(f.hint) else '->'} {text}")
+        rep.w(f"{indent}          {'$' if is_command(f.hint) else '->'} {hint_text(f)}")
     rep.w()
 
 
 def build_report(roots, trees, scanner, args):
     rep = Report()
-    info = disk_overview()
+    info = SYS.usage()
 
     rep.h1("DISK")
-    used_frac = info["used"] / info["total"]
+    used_frac = info["used"] / info["total"] if info["total"] else 0
     rep.w(f"  volume    {human(info['total'])} total, {human(info['used'])} used "
           f"({used_frac * 100:.0f}%), {human(info['free'])} free")
     rep.w(f"            [{bar(used_frac, 60)}]")
-    if info.get("purgeable_raw"):
-        rep.w(f"  purgeable {info['purgeable_raw']}  (macOS frees this on demand; "
-              f"it is already counted as free)")
-    if info["snapshots"]:
-        rep.w(f"  snapshots {len(info['snapshots'])} Time Machine local snapshot(s) "
-              f"holding deleted files hostage")
-        for s in info["snapshots"][:5]:
-            rep.w(f"            {s}")
-        rep.w("            they expire on their own within 24h; "
-              "to force: tmutil deletelocalsnapshots <date>")
+    SYS.render_disk(rep, info, bar, human)
     scanned = sum(t.size for t in trees)
+    rep.w()
     rep.w(f"  scanned   {human(scanned)} across {scanner.dirs:,} dirs / "
           f"{scanner.files:,} files")
+    if scanner.skipped:
+        rep.w(f"  not walked {len(scanner.skipped)} mount point(s): another "
+              f"filesystem, or a second view of bytes already counted")
 
     # ---- where the space is
     rep.h1("WHERE THE SPACE IS")
@@ -458,8 +482,9 @@ def build_report(roots, trees, scanner, args):
           f"no data loss")
     rep.w(f"  {human(caution_total):>8}  CAUTION   recoverable but costs a re-download "
           f"or loses app state")
+    pct = (safe_total + caution_total) / info["total"] * 100 if info["total"] else 0
     rep.w(f"  {human(safe_total + caution_total):>8}  reclaimable in total "
-          f"({(safe_total + caution_total) / info['total'] * 100:.0f}% of the volume)")
+          f"({pct:.0f}% of the volume)")
     rep.w()
     rep.w("  Nothing below has been touched. This tool cannot delete: run the")
     rep.w("  commands yourself, top of the list first, and re-run to verify.")
@@ -467,6 +492,9 @@ def build_report(roots, trees, scanner, args):
     rep.h2("DO THIS, IN THIS ORDER")
     rep.w("   Free wins first, then the ones that cost you something. The running")
     rep.w("   total is what you get back if you stop at that line.")
+    if SYS.trash_setup:
+        rep.w(f"   Some hints move things aside instead of deleting them; run "
+              f"`{SYS.trash_setup}` once first.")
     step, cum = 1, 0
     for tier, title in ((safe, "no downside"), (caution, "you pay something")):
         rows = [f for f in tier if f.own_share >= 500 * MB][:10]
@@ -479,8 +507,7 @@ def build_report(roots, trees, scanner, args):
             rep.w(f"  {step:>2}. {human(f.own_share):>7}  (total {human(cum):>7})  "
                   f"{rel(f.path)}")
             if f.hint:
-                text = f.hint.format(path=f.path)
-                rep.w(f"      {'$' if is_command(f.hint) else '->'} {text}")
+                rep.w(f"      {'$' if is_command(f.hint) else '->'} {hint_text(f)}")
             step += 1
     rep.w()
 
@@ -506,7 +533,8 @@ def build_report(roots, trees, scanner, args):
              "Recoverable, but you pay for it -- bandwidth, re-login, lost local state.")
     if keep:
         rep.h2("KEEP -- REAL DATA")
-        rep.w("   Big, but it is yours. Shrink these through the app, never with rm.")
+        rep.w("   Big, but it is yours. Shrink these through the app that owns them,")
+        rep.w("   never with rm.")
         rep.w()
         for f in keep:
             if f.own_share < args.min_size or "bundle" in f.tags:
@@ -514,10 +542,10 @@ def build_report(roots, trees, scanner, args):
             rep.w(f"  {human(f.own_share):>8}  {rel(f.path)}")
             rep.w(f"            {f.label}")
             if f.hint:
-                rep.w(f"            -> {f.hint.format(path=f.path)}")
+                rep.w(f"            -> {hint_text(f)}")
             rep.w()
 
-    # ---- installed apps: the one KEEP category worth enumerating
+    # ---- installed apps: the one KEEP category worth enumerating (macOS)
     apps = next((t for t in trees if t.path == "/Applications"), None)
     if apps:
         rep.h2("INSTALLED APPS, LARGEST FIRST")
@@ -534,35 +562,42 @@ def build_report(roots, trees, scanner, args):
     rep.w("   Directories with many bytes sitting directly inside them and no rule")
     rep.w("   matching. Decide these by hand.")
     rep.w()
+    unknowns = 0
     for t in sorted(trees, key=lambda n: n.size, reverse=True)[:6]:
         for own, path, nfiles in unclassified(t, findings, args.min_size, 8):
             rep.w(f"  {human(own):>8}  {rel(path)}  ({nfiles} files here)")
+            unknowns += 1
+    if not unknowns:
+        rep.w(f"   None above {human(args.min_size)}: every heavy directory matched "
+              f"a rule.")
 
     rep.h2("BIGGEST INDIVIDUAL FILES")
     rep.w()
-    for sz, path in scanner.biggest_files()[:20]:
+    biggest = scanner.biggest_files()[:20]
+    for sz, path in biggest:
         rep.w(f"  {human(sz):>8}  {rel(path)}")
+    if not biggest:
+        rep.w("   Nothing above 8M -- the space is in the count of files, not in any"
+              " one of them.")
+
+    # ---- what a directory walk cannot see (platform-specific)
+    SYS.render_extras(rep, human, probe=not args.no_probe)
 
     # ---- caveats
     rep.h2("READ BEFORE YOU DELETE")
     rep.w("""
-   * Quit the app that owns a cache first. Deleting a live cache under a running
-     app is how you corrupt its database, and that is the one way a "safe" cache
-     removal turns into data loss.
-   * Move to ~/.Trash instead of rm -rf. Same space freed once you empty it, but
-     reversible until then.
-   * Sizes are allocated blocks. APFS clones share blocks, so a cloned file is
-     counted in full under every name -- the sum can exceed real disk usage, and
-     deleting one copy frees less than stated.
-   * A cache re-fills. Chrome will rebuild 10G of cache over the following weeks.
-     If you need the space permanently, cap it in the app or uninstall the app.
-   * Browser profiles hold cookies and logins next to the caches. Clearing cache
-     from inside the browser is safe; deleting the profile folder logs you out
-     everywhere and can lose saved passwords not synced to your account.""")
+   * Stop the service or app that owns a cache first. Deleting a live cache
+     under a running process is how you corrupt its database, and that is the
+     one way a "safe" cache removal turns into data loss.
+   * Move things aside instead of rm -rf. The space comes back only once you
+     empty the trash or the staging directory, but until then it is reversible.
+   * A cache re-fills. If you need the space permanently, cap it in the tool
+     that writes it -- the hints above say how, wherever such a setting exists.""")
+    if SYS.caveats:
+        rep.w(SYS.caveats)
     if scanner.denied:
         rep.h2(f"NOT MEASURED -- {len(scanner.denied)} PATHS DENIED")
-        rep.w("   Numbers above are lower bounds. Grant Full Disk Access to your")
-        rep.w("   terminal (System Settings -> Privacy & Security) to see these.")
+        rep.w("   Numbers above are lower bounds.")
         rep.w()
         for path, err in scanner.denied[:12]:
             rep.w(f"   {rel(path)}  ({err})")
@@ -570,7 +605,8 @@ def build_report(roots, trees, scanner, args):
             rep.w(f"   ... and {len(scanner.denied) - 12} more")
 
     return rep, {
-        "disk": info,
+        "platform": SYS.name,
+        "disk": {k: v for k, v in info.items() if not isinstance(v, bytes)},
         "safe_total": safe_total,
         "caution_total": caution_total,
         "findings": [
@@ -582,6 +618,7 @@ def build_report(roots, trees, scanner, args):
         "biggest_files": [{"path": p, "size": s}
                           for s, p in scanner.biggest_files()[:30]],
         "denied": [{"path": p, "error": e} for p, e in scanner.denied],
+        "not_walked": scanner.skipped,
     }
 
 
@@ -613,6 +650,15 @@ def to_markdown(data, args):
     return "\n".join(L) + "\n"
 
 
+def parse_size(s):
+    s = s.strip().upper()
+    mult = 1
+    if s and s[-1] in "KMGT":
+        mult = {"K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}[s[-1]]
+        s = s[:-1]
+    return int(float(s) * mult)
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(
         description="Measure disk usage and report what is safe to reclaim. "
@@ -628,9 +674,11 @@ def main(argv=None):
     p.add_argument("-j", "--jobs", type=int, default=8, help="scan threads (8)")
     p.add_argument("--cross-fs", action="store_true",
                    help="follow into other filesystems (default: stay on one)")
+    p.add_argument("--no-probe", action="store_true",
+                   help="skip external probes (journalctl, snap, docker system df)")
     args = p.parse_args(argv)
 
-    raw = args.roots or DEFAULT_ROOTS
+    raw = args.roots or SYS.default_roots
     roots = []
     for r in raw:
         path = os.path.realpath(os.path.expanduser(r))
@@ -640,12 +688,13 @@ def main(argv=None):
             continue
         elif not os.path.isdir(path):
             print(f"disku: no such directory: {r}", file=sys.stderr)
+    roots = prune_contained(roots)
 
     if not roots:
         print("disku: nothing to scan", file=sys.stderr)
         return 1
 
-    scanner = Scanner(one_fs=not args.cross_fs)
+    scanner = Scanner(one_fs=not args.cross_fs, skip=SYS.skip_dir)
     trees = []
     for root in roots:
         print(f"scanning {rel(root)} ...", file=sys.stderr, end="", flush=True)
@@ -673,15 +722,6 @@ def main(argv=None):
             fh.write(to_markdown(data, args))
         print(f"wrote {args.md}", file=sys.stderr)
     return 0
-
-
-def parse_size(s):
-    s = s.strip().upper()
-    mult = 1
-    if s and s[-1] in "KMGT":
-        mult = {"K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}[s[-1]]
-        s = s[:-1]
-    return int(float(s) * mult)
 
 
 if __name__ == "__main__":
