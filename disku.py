@@ -86,8 +86,13 @@ def is_command(hint):
 
 
 def hint_text(f):
-    """The hint as you would actually run it against this particular path."""
-    text = f.hint.format(path=f.path)
+    """The hint as you would actually run it against this particular path.
+
+    Substituted by hand, not with str.format: a hint is prose, and prose
+    contains braces. One of them is a daemon.json snippet, which format()
+    reads as a replacement field and dies on.
+    """
+    text = f.hint.replace("{path}", f.path)
     if text.startswith('mv "'):
         parent = os.path.dirname(f.path.rstrip("/")) or "/"
         if not os.access(parent, os.W_OK):
@@ -640,7 +645,7 @@ def to_markdown(data, args):
         L += [f"## {title}", "", "| Size | Path | What it is | How to reclaim |",
               "|---|---|---|---|"]
         for f in rows:
-            hint = f["hint"].format(path=f["path"]).replace("|", "\\|") or "--"
+            hint = f["hint"].replace("{path}", f["path"]).replace("|", "\\|") or "--"
             L.append(f"| {human(f['own_share'])} | `{rel(f['path'])}` | "
                      f"{f['label']} | `{hint}` |")
         L.append("")
