@@ -1,0 +1,3 @@
+#!/bin/sh
+# Thin shim, same as ./disku: run it from anywhere.
+exec /usr/bin/env python3 "$(dirname "$0")/disku_clean.py" "$@"

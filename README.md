@@ -3,9 +3,13 @@
 Finds where disk space went on **Linux** and **macOS**, and says what is safe to
 drop.
 
-**It never deletes anything.** There is no `rm`, `unlink`, `rmtree`, `mv` or
-`truncate` call anywhere in the source — the tool measures, classifies, and
-prints commands for you to read and run yourself.
+**The scanner never deletes anything.** There is no `rm`, `unlink`, `rmtree`,
+`mv` or `truncate` call anywhere in `disku.py`, `system.py` or the rule
+files — the tool measures, classifies, and prints commands for you to read and
+run yourself.
+
+Running them is the job of a second, separate program, [`disku-clean`](#disku-clean),
+which does nothing until you pass `--yes`.
 
 ```bash
 ./disku                       # full report on the usual suspects
@@ -99,6 +103,54 @@ Known limits, also printed at the bottom of every report:
 - A cache refills. Capping it in the tool that writes it beats deleting it
   repeatedly, and the hints say how wherever such a setting exists.
 
+## disku-clean
+
+The half that acts. It reads disku's own findings — a fresh scan, or a report
+you already have — keeps the ones the knowledge base calls `SAFE`, and runs the
+reclaim command each matching rule names. It is a separate file on purpose, so
+"the scanner never deletes" stays a fact about the scanner.
+
+```bash
+./disku-clean                  # the plan, nothing else: a dry run is the default
+./disku-clean --yes            # run it
+sudo ./disku-clean --yes       # most of /var needs root, to see it and to clean it
+./disku-clean --yes --trash    # move aside into a staging dir instead of deleting
+./disku-clean --from report.json --yes    # reuse a scan instead of repeating it
+./disku-clean --yes --caution  # also what costs a re-download or some app state
+./disku-clean --yes --docker-age 168      # only docker objects unused for a week
+```
+
+Nothing happens without `--yes`. The dry run prints the exact command line of
+every step, in the order the report recommends, with what each is expected to
+return.
+
+**Docker gets asked, not walked.** `/var/lib/docker` is one opaque tree to a
+directory walker, which is why disku classifies it `CAUTION` and stops there:
+only the daemon knows which layer nothing refers to any more. So `disku-clean`
+asks it — `docker system df` for the sizes, then `container prune`,
+`image prune` (dangling only, unless you pass `--docker-images`), `builder
+prune` and `buildx prune` for the parts it calls reclaimable. **Volumes are
+never pruned**: that is where databases and uploads live.
+
+What it refuses to do, with any flag:
+
+- touch anything classified `KEEP`, or any `CAUTION` entry without `--caution`
+  — and even then only through the owning tool's own command, never a
+  hand-written `rm`
+- run a hint that is advice rather than a command (`/usr/local`, `/opt`,
+  kernels, snap revisions: yours to decide)
+- remove a path that is a system root, a home directory, or shallow enough to
+  be one. Every command is re-checked after the scanned path has been
+  interpolated into it, because that is where a curated string stops being one
+- delete a cache while the app that owns it is running (`--force` overrides);
+  that is the one way a "safe" cache removal turns into data loss
+- run anything that only looks (`docker system df`, `nvm ls`): those free
+  nothing and are reported instead
+
+Freed space is **measured**, not estimated: `statvfs` before and after each
+command, so the final number is what the filesystem actually gave back rather
+than what the walk predicted.
+
 ## Adding a rule
 
 ```python
@@ -128,4 +180,5 @@ container whose *contents* are nobody's business but yours (`/home`, `/srv`,
 - `rules_linux.py` — the Linux knowledge base (~180 rules)
 - `rules_darwin.py` — the macOS knowledge base (~120 rules)
 - `rules.py` — the `Rule` type and the matcher, shared by both
-- `disku` — shim so it runs from anywhere
+- `disku_clean.py` — the only file that runs anything; everything above is read-only
+- `disku`, `disku-clean` — shims so both run from anywhere
